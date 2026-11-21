@@ -21,11 +21,14 @@ jobs:
     defaults:
       run:
         working-directory: Android/AceRFID
-    env:
-      VERSION_CODE: ${{ 100 + github.run_number }}
-      VERSION_NAME: 1.${{ github.run_number }}
-      TAG: android-${{ github.run_number }}
     steps:
+      - name: Set version
+        working-directory: .
+        run: |
+          echo "VERSION_CODE=$((100 + ${{ github.run_number }}))" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=1.${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "TAG=android-${{ github.run_number }}" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
