@@ -2,6 +2,11 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
+// CI (GitHub Actions) passes version and signing info via environment variables.
+def ciVersionCode = System.getenv("VERSION_CODE")
+def ciVersionName = System.getenv("VERSION_NAME")
+def signingKeystore = System.getenv("SIGNING_KEYSTORE_PATH")
+
 android {
     namespace 'dngsoftware.acerfid'
     compileSdk 36
@@ -10,12 +15,26 @@ android {
         applicationId "dngsoftware.acerfid"
         minSdk 19
         targetSdk 36
-        versionCode 1
-        versionName "1"
+        versionCode ciVersionCode ? Integer.parseInt(ciVersionCode) : 1
+        versionName ciVersionName ?: "1"
+    }
+
+    signingConfigs {
+        release {
+            if (signingKeystore) {
+                storeFile file(signingKeystore)
+                storePassword System.getenv("SIGNING_STORE_PASSWORD")
+                keyAlias System.getenv("SIGNING_KEY_ALIAS")
+                keyPassword System.getenv("SIGNING_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
+            if (signingKeystore) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
