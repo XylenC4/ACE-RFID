@@ -119,4 +119,8 @@
     <string name="launch_app">Launch APP</string>
     <string name="dark_mode">Dark Mode</string>
     <string name="app">App</string>
+    <string name="tap_to_write">Tap to Write</string>
+    <string name="ready_to_write">Ready to write</string>
+    <string name="hold_tag_to_write">Hold the tag against the back of your phone now.\n(If it is already lying there, lift it away and tap it again.)</string>
+    <string name="tap_again_to_retry">Hold the tag to the phone again to retry.</string>
 </resources>

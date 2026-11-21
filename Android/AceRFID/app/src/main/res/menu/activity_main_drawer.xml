@@ -33,6 +33,11 @@
                 android:title="@string/auto_read"
                 app:actionLayout="@layout/switch_item" />
             <item
+                android:id="@+id/nav_tapwrite"
+                android:icon="@drawable/twotone_edit_24"
+                android:title="@string/tap_to_write"
+                app:actionLayout="@layout/switch_item" />
+            <item
                 android:id="@+id/nav_format"
                 android:icon="@drawable/twotone_layers_clear_24"
                 android:title="@string/format_tag" />

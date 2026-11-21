@@ -25,6 +25,8 @@ import android.net.Uri;
 import android.nfc.NfcAdapter;
 import android.nfc.Tag;
 import android.nfc.tech.NfcA;
+import android.nfc.tech.MifareUltralight;
+import java.io.IOException;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
@@ -84,6 +86,10 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     private NfcAdapter nfcAdapter;
     Tag currentTag = null;
     int tagType;
+    // Tap-to-write: pages armed by the Write button, written on the next tag tap
+    private volatile int[] pendingPages = null;
+    private volatile byte[][] pendingData = null;
+    private AlertDialog writeDialog;
     ArrayAdapter<String> madapter, sadapter;
     String MaterialName, MaterialWeight = "1 KG", MaterialColor = "FF0000FF";
     Dialog pickerDialog, addDialog, customDialog, tagDialog;
@@ -152,6 +158,13 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             SaveSetting(this, "autoread", isChecked);
         });
 
+        MenuItem tapWriteItem = navigationView.getMenu().findItem(R.id.nav_tapwrite);
+        SwitchCompat tapWriteSwitch = Objects.requireNonNull(tapWriteItem.getActionView()).findViewById(R.id.drawer_switch);
+        tapWriteSwitch.setChecked(GetSetting(this, "tapwrite", false));
+        tapWriteSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            SaveSetting(this, "tapwrite", isChecked);
+        });
+
         MenuItem darkItem = navigationView.getMenu().findItem(R.id.nav_dark);
         SwitchCompat darkSwitch = Objects.requireNonNull(darkItem.getActionView()).findViewById(R.id.drawer_switch);
         darkSwitch.setChecked(GetSetting(this, "enabledm", false));
@@ -169,7 +182,13 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         main.txtcolor.setText(MaterialColor);
         main.txtcolor.setTextColor(getContrastColor(Color.parseColor("#" + MaterialColor)));
         main.readbutton.setOnClickListener(view -> readTag(currentTag));
-        main.writebutton.setOnClickListener(view -> writeTag(currentTag));
+        main.writebutton.setOnClickListener(view -> {
+            if (GetSetting(this, "tapwrite", false)) {
+                armWrite();
+            } else {
+                writeTag(currentTag);
+            }
+        });
 
         main.menubutton.setOnClickListener(view -> drawerLayout.openDrawer(GravityCompat.START));
         main.addbutton.setOnClickListener(view -> openAddDialog(false));
@@ -315,6 +334,11 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
     @Override
     public void onTagDiscovered(Tag tag) {
+        if (pendingPages != null) {
+            // Tap-to-write: write immediately on the NFC thread while the tag is fresh in the field.
+            handlePendingWrite(tag);
+            return;
+        }
         try {
             mainHandler.post(() -> {
                 byte[] uid = tag.getId();
@@ -581,6 +605,233 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             }
         });
     }
+
+
+    /** Builds the page -> 4-byte payload list for the currently selected filament. Must run off the UI thread (Room). */
+    private void buildWritePages(java.util.List<Integer> pages, java.util.List<byte[]> data) {
+        byte[] sku = GetSku(matDb, MaterialName);
+        byte[] brand = GetBrand(matDb, MaterialName);
+        int[] temps = GetTemps(matDb, MaterialName);
+        pages.add(4); data.add(new byte[]{123, 0, 101, 0});
+        for (int i = 0; i < 5; i++) { pages.add(5 + i); data.add(pad4(subArray(sku, i * 4, 4))); }    //sku
+        for (int i = 0; i < 5; i++) { pages.add(10 + i); data.add(pad4(subArray(brand, i * 4, 4))); } //brand
+        byte[] matData = new byte[20];
+        byte[] nameBytes = MaterialName.getBytes(StandardCharsets.UTF_8);
+        System.arraycopy(nameBytes, 0, matData, 0, Math.min(20, nameBytes.length));
+        for (int i = 0; i < 4; i++) { pages.add(15 + i); data.add(subArray(matData, i * 4, 4)); }     //type
+        String color = MaterialColor.substring(2);
+        String alpha = MaterialColor.substring(0, 2);
+        if (color.equals("000000")) {
+            color = "010101";
+        }
+        pages.add(20); data.add(pad4(combineArrays(hexToByte(alpha), parseColor(color))));            //color
+        byte[] extTemp = new byte[4];
+        System.arraycopy(numToBytes(temps[0]), 0, extTemp, 0, 2); //min
+        System.arraycopy(numToBytes(temps[1]), 0, extTemp, 2, 2); //max
+        pages.add(24); data.add(extTemp);
+        byte[] bedTemp = new byte[4];
+        System.arraycopy(numToBytes(temps[2]), 0, bedTemp, 0, 2); //min
+        System.arraycopy(numToBytes(temps[3]), 0, bedTemp, 2, 2); //max
+        pages.add(29); data.add(bedTemp);
+        byte[] filData = new byte[4];
+        System.arraycopy(numToBytes(175), 0, filData, 0, 2); //diameter
+        System.arraycopy(numToBytes(GetMaterialLength(MaterialWeight)), 0, filData, 2, 2); //length
+        pages.add(30); data.add(filData);
+        pages.add(31); data.add(new byte[]{(byte) 232, 3, 0, 0}); // weight in grams
+    }
+
+    private static byte[] pad4(byte[] b) {
+        byte[] out = new byte[4];
+        System.arraycopy(b, 0, out, 0, Math.min(4, b.length));
+        return out;
+    }
+
+    /** Write button: prepare the data, then ask the user to tap the tag (NFC Tools style). */
+    private void armWrite() {
+        executorService.execute(() -> {
+            java.util.List<Integer> pages = new java.util.ArrayList<>();
+            java.util.List<byte[]> data = new java.util.ArrayList<>();
+            try {
+                buildWritePages(pages, data);
+            } catch (Exception e) {
+                showToast(getString(R.string.error_writing_to_tag) + ": " + e, Toast.LENGTH_LONG);
+                return;
+            }
+            int[] p = new int[pages.size()];
+            for (int i = 0; i < p.length; i++) p[i] = pages.get(i);
+            mainHandler.post(() -> {
+                pendingData = data.toArray(new byte[0][]);
+                pendingPages = p;
+                showWriteDialog(getString(R.string.hold_tag_to_write));
+            });
+        });
+    }
+
+    private void showWriteDialog(String message) {
+        if (writeDialog != null && writeDialog.isShowing()) {
+            writeDialog.setMessage(message);
+            return;
+        }
+        SpannableString titleText = new SpannableString(getString(R.string.ready_to_write));
+        titleText.setSpan(new ForegroundColorSpan(ContextCompat.getColor(this, R.color.primary_brand)), 0, titleText.length(), 0);
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle(titleText);
+        builder.setMessage(message);
+        builder.setCancelable(false);
+        builder.setNegativeButton(R.string.cancel, (dialog, which) -> {
+            pendingPages = null;
+            pendingData = null;
+            dialog.dismiss();
+        });
+        writeDialog = builder.create();
+        writeDialog.show();
+        if (writeDialog.getWindow() != null) {
+            writeDialog.getWindow().setBackgroundDrawableResource(R.color.background_alt);
+            writeDialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(ContextCompat.getColor(this, R.color.primary_brand));
+        }
+    }
+
+    /** Minimal raw-transceive wrapper so we can use MifareUltralight (preferred) or NfcA. */
+    private interface TagIO {
+        byte[] tx(byte[] cmd) throws IOException;
+        void reconnect() throws IOException;
+        void close();
+    }
+
+    private TagIO openTagIO(Tag tag) throws IOException {
+        MifareUltralight mu = MifareUltralight.get(tag);
+        if (mu != null) {
+            mu.setTimeout(1000);
+            mu.connect();
+            return new TagIO() {
+                public byte[] tx(byte[] cmd) throws IOException { return mu.transceive(cmd); }
+                public void reconnect() throws IOException { try { mu.close(); } catch (Exception ignored) {} mu.connect(); }
+                public void close() { try { mu.close(); } catch (Exception ignored) {} }
+            };
+        }
+        NfcA nfcA = NfcA.get(tag);
+        if (nfcA == null) throw new IOException(getString(R.string.invalid_tag_type));
+        nfcA.setTimeout(1000);
+        nfcA.connect();
+        return new TagIO() {
+            public byte[] tx(byte[] cmd) throws IOException { return nfcA.transceive(cmd); }
+            public void reconnect() throws IOException { try { nfcA.close(); } catch (Exception ignored) {} nfcA.connect(); }
+            public void close() { try { nfcA.close(); } catch (Exception ignored) {} }
+        };
+    }
+
+    /** Identify NTAG213/215/216 via GET_VERSION; falls back to Ultralight C (100) if unsupported. */
+    private int detectTagType(TagIO io) throws IOException {
+        try {
+            byte[] v = io.tx(new byte[]{0x60});
+            if (v != null && v.length >= 7) {
+                switch (v[6] & 0xFF) {
+                    case 0x0F: return 213;
+                    case 0x11: return 215;
+                    case 0x13: return 216;
+                }
+            }
+            return 213;
+        } catch (IOException e) {
+            io.reconnect(); // NAK puts the tag in HALT; re-select it
+            return 100;
+        }
+    }
+
+    /** Returns null on success, otherwise an error message. Runs on the NFC callback thread. */
+    private String writePagesToTag(Tag tag, int[] pages, byte[][] data) {
+        TagIO io = null;
+        try {
+            io = openTagIO(tag);
+            int type = detectTagType(io);
+            tagType = type;
+
+            // Password protection (NTAG21x): CFG page byte 3 = AUTH0 (first protected page)
+            if (type != 100) {
+                int cfgPage = type == 216 ? 227 : type == 215 ? 131 : 41;
+                byte[] cfg = io.tx(new byte[]{0x30, (byte) cfgPage});
+                int auth0 = cfg[3] & 0xFF;
+                if (auth0 <= 31) {
+                    boolean ok = false;
+                    for (byte[] pwd : new byte[][]{{(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF}, {0, 0, 0, 0}}) {
+                        try {
+                            byte[] r = io.tx(new byte[]{0x1B, pwd[0], pwd[1], pwd[2], pwd[3]});
+                            if (r != null && r.length == 2) { ok = true; break; }
+                        } catch (IOException e) {
+                            io.reconnect();
+                        }
+                    }
+                    if (!ok) return getString(R.string.password_failed_unable_to_write_to_this_tag);
+                }
+            }
+
+            for (int i = 0; i < pages.length; i++) {
+                byte[] d = data[i];
+                byte[] cmd = new byte[]{(byte) 0xA2, (byte) pages[i], d[0], d[1], d[2], d[3]};
+                IOException last = null;
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    try {
+                        io.tx(cmd);
+                        last = null;
+                        break;
+                    } catch (IOException e) {
+                        last = e;
+                        // Some controllers report the 4-bit ACK as an error; verification below will catch real failures.
+                        try { io.reconnect(); } catch (IOException ignored) {}
+                    }
+                }
+                if (last != null) return "page " + pages[i] + ": " + last.getMessage();
+            }
+
+            // Verify by reading back (READ returns 4 pages)
+            java.util.Map<Integer, byte[]> readCache = new java.util.HashMap<>();
+            for (int i = 0; i < pages.length; i++) {
+                int base = pages[i] & ~3;
+                byte[] block = readCache.get(base);
+                if (block == null) {
+                    block = io.tx(new byte[]{0x30, (byte) base});
+                    readCache.put(base, block);
+                }
+                byte[] got = subArray(block, (pages[i] - base) * 4, 4);
+                if (!Arrays.equals(got, data[i])) {
+                    return "verify failed at page " + pages[i] + " (" + bytesToHex(got, false) + " != " + bytesToHex(data[i], false) + ")";
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
+        } finally {
+            if (io != null) io.close();
+        }
+    }
+
+    private void handlePendingWrite(Tag tag) {
+        int[] pages = pendingPages;
+        byte[][] data = pendingData;
+        if (pages == null || data == null) return;
+        String err = writePagesToTag(tag, pages, data);
+        if (err == null) {
+            pendingPages = null;
+            pendingData = null;
+            playBeep();
+        }
+        mainHandler.post(() -> {
+            currentTag = tag;
+            main.tagid.setText(bytesToHex(tag.getId(), true));
+            if (tagType == 100) main.tagtype.setText(R.string.ultralight_c);
+            else main.tagtype.setText(String.format(Locale.getDefault(), "   NTAG%d", tagType));
+            main.lbltagid.setVisibility(View.VISIBLE);
+            main.lbltagtype.setVisibility(View.VISIBLE);
+            if (err == null) {
+                if (writeDialog != null && writeDialog.isShowing()) writeDialog.dismiss();
+                showToast(R.string.data_written_to_tag, Toast.LENGTH_SHORT);
+            } else {
+                // Stay armed so the user can simply tap again
+                showWriteDialog(getString(R.string.error_writing_to_tag) + ":\n" + err + "\n\n" + getString(R.string.tap_again_to_retry));
+            }
+        });
+    }
+
 
 
     private boolean checkTagAuth(NfcA nfcA) {
